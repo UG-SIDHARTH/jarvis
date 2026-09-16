@@ -7,7 +7,7 @@ import { initDatabase, closeDb, getDb } from './schema';
 import { createEntity, findEntities } from './entities';
 import { createFact, correctFact, findFacts, getFact, verifyFact, queryFact, updateFact, deleteFact } from './facts';
 import { getKnowledgeForMessage } from './retrieval';
-import { describeFact } from './fact-format';
+import { describeFact, formatFact } from './fact-format';
 import { createFactDecisionRoutes } from './fact-routes';
 import { saveUserProfile, getUserProfile, appendUserProfileFact } from './user-profile';
 import { formatUserProfileForPrompt, USER_PROFILE_SETTING_KEY } from '../user/profile';
@@ -95,9 +95,28 @@ test('scope and disjoint validity periods remain separate; expired values cannot
   expect(queryFact('Alex', 'preferred_editor')?.id).toBe(current.id);
   expect(queryFact('Alex', 'preferred_editor', 'personal')?.object).toBe('Personal');
   expect(queryFact('Alex', 'primary_email')).toBeNull();
-  expect(getKnowledgeForMessage('Alex')).toContain('"valid_to":');
-  expect(getKnowledgeForMessage('Alex')).toContain('"validity":"outside recorded validity"');
-  expect(getKnowledgeForMessage('Alex')).toContain('"binding_eligible":false');
+  // Same property, enforced one step earlier: ranked recall selects only values
+  // that apply now, so an expired value never reaches the prompt to be misread.
+  // The row stays inspectable and non-binding through the fact APIs above.
+  const recall = getKnowledgeForMessage('Alex');
+  expect(recall).toContain('preferred_editor: Current');
+  expect(recall).not.toContain('preferred_editor: Old');
+  expect(recall).not.toContain('old@example.com');
+  expect(recall.split('\n').find(entry => entry.includes('preferred_editor: Current')))
+    .toContain('"binding_eligible":true');
+  // Withheld, not hidden: the block says it is not the whole record, and the
+  // expired row stays inspectable and non-binding through the fact APIs.
+  expect(recall).toContain('not an exhaustive record');
+  expect(getFact(expired.id)?.binding_eligible).toBe(false);
+});
+
+// C3: the marking has no recall caller now that recall withholds these rows, so
+// it is asserted directly rather than left unreachable and untested.
+test('an out of period value is still marked as outside its validity when shown', () => {
+  const expired = createFact(subject, 'primary_email', 'old@example.com', { confirmed: true, validTo: Date.now() - 100 });
+  const formatted = formatFact(getFact(expired.id)!);
+  expect(formatted).toContain('"validity":"outside recorded validity"');
+  expect(formatted).toContain('"binding_eligible":false');
 });
 
 test('overlapping but different confirmed periods are contested, not silently superseded', () => {
