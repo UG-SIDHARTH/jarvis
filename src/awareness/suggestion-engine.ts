@@ -10,6 +10,7 @@ import type { ScreenContext, AwarenessEvent, Suggestion, SuggestionType } from '
 import { createSuggestion, findAutomationSuggestion, getSuggestionCountSince, getActivityInRange, MAX_CAPTURE_GAP_MS } from '../vault/awareness.ts';
 import { searchEntitiesByName } from '../vault/entities.ts';
 import { findFacts } from '../vault/facts.ts';
+import { describeFact } from '../vault/fact-format.ts';
 
 const MAX_DEDUP_HASHES = 50;
 
@@ -321,9 +322,12 @@ export class SuggestionEngine {
 
           this.lastKnowledgeEntityId = entity.id;
 
+          // A person reads this body, so each fact carries its qualification in
+          // words. The machine-readable provenance formatFact emits is for a
+          // prompt; dumped here it would bury the suggestion in JSON.
           const factSummary = facts
             .slice(0, 3)
-            .map(f => `${f.predicate}: ${f.object}`)
+            .map(describeFact)
             .join('; ');
 
           return {
