@@ -232,6 +232,21 @@ export class ChannelService implements Service {
     });
   }
 
+  /** Resolve once, before workflow approval; never switch to a later sender. */
+  getBroadcastRecipient(channel: string): string | null {
+    return this.lastRecipients.get(channel) ?? null;
+  }
+
+  async sendWorkflowNotification(channel: string, recipient: string | null, text: string): Promise<void> {
+    const adapter = this.manager.getChannel(channel);
+    if (!adapter?.isConnected()) throw new Error(`Channel ${channel} is unavailable`);
+    if (!recipient) throw new Error(`No approved recipient for ${channel}`);
+    // Last gate before the adapter hands the message off. The governed caller
+    // installs its Authority/emergency checkpoint in the execution scope.
+    checkpointExecution();
+    await adapter.sendMessage(recipient, text);
+  }
+
   /**
    * Load broadcast recipients persisted by a previous run. Keys are
    * `${LAST_RECIPIENT_PREFIX}<channel>`; only non-empty values are restored.
