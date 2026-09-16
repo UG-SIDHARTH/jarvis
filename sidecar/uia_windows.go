@@ -37,6 +37,7 @@ const (
 	UIA_IsEnabledPropertyId           = 30010
 	UIA_AutomationIdPropertyId        = 30011
 	UIA_ClassNamePropertyId           = 30012
+	UIA_IsOffscreenPropertyId         = 30022
 )
 
 // UIAutomation pattern IDs
@@ -472,24 +473,36 @@ func controlTypeName(id int) string {
 // buildElementInfo extracts element properties into a map matching the expected JSON shape.
 func buildElementInfo(elem *ole.IDispatch, id, depth int) map[string]any {
 	x, y, w, h := uiaElementGetBoundingRect(elem)
-	name := uiaElementGetPropertyStr(elem, UIA_NamePropertyId)
-	if len(name) > 100 {
-		name = name[:100]
-	}
-	ctrlType := uiaElementGetPropertyInt(elem, UIA_ControlTypePropertyId)
+	name := truncateRunes(uiaElementGetPropertyStr(elem, UIA_NamePropertyId), 100)
+	ctrl := controlTypeName(uiaElementGetPropertyInt(elem, UIA_ControlTypePropertyId))
+	autoID := uiaElementGetPropertyStr(elem, UIA_AutomationIdPropertyId)
+	return buildElementInfoPrefetched(elem, id, depth, name, ctrl, autoID, x, y, w, h)
+}
 
-	return map[string]any{
+// buildElementInfoPrefetched is buildElementInfo for callers that already
+// read name/control-type/automation-id/bounds (the tree walk reads them for
+// ordinal computation) — avoids duplicate cross-process COM property reads.
+func buildElementInfoPrefetched(elem *ole.IDispatch, id, depth int, name, ctrl, autoID string, x, y, w, h int) map[string]any {
+	info := map[string]any{
 		"id":            id,
 		"name":          name,
-		"automation_id": uiaElementGetPropertyStr(elem, UIA_AutomationIdPropertyId),
+		"automation_id": autoID,
 		"class_name":    uiaElementGetPropertyStr(elem, UIA_ClassNamePropertyId),
-		"control_type":  controlTypeName(ctrlType),
+		"control_type":  ctrl,
 		"enabled":       uiaElementGetPropertyBool(elem, UIA_IsEnabledPropertyId),
 		"focusable":     uiaElementGetPropertyBool(elem, UIA_IsKeyboardFocusablePropertyId),
 		"rect":          map[string]any{"x": x, "y": y, "w": w, "h": h},
 		"patterns":      getSupportedPatterns(elem),
 		"depth":         depth,
 	}
+	// Only present when true. Every key here is pretty-printed straight into
+	// the model's context (routeToSidecar JSON.stringify), so a per-element
+	// "offscreen": false on every snapshot would be pure payload -- and
+	// offscreen is only ever interesting when it is the reason a click failed.
+	if uiaElementGetPropertyBool(elem, UIA_IsOffscreenPropertyId) {
+		info["offscreen"] = true
+	}
+	return info
 }
 
 // getSupportedPatterns checks which UIA patterns are available on an element.
@@ -560,7 +573,10 @@ func resolvePid(pid int) (int, error) {
 
 // walkTree recursively walks the UIAutomation tree using FindAll(TreeScope_Children).
 // trueCond is a pre-created TrueCondition to avoid repeated COM allocations.
-func walkTree(state *uiaState, trueCond *ole.IDispatch, parent *ole.IDispatch, depth, maxDepth int, includeInvisible bool, results *[]map[string]any) {
+// When semantic is true each emitted element also carries its ancestry path,
+// sibling ordinal, and durable sig (kept opt-in: paths meaningfully grow the
+// JSON payload the LLM currently reads verbatim).
+func walkTree(state *uiaState, trueCond *ole.IDispatch, parent *ole.IDispatch, depth, maxDepth int, includeInvisible, semantic bool, path []map[string]any, results *[]map[string]any) {
 	if depth > maxDepth {
 		return
 	}
@@ -571,34 +587,69 @@ func walkTree(state *uiaState, trueCond *ole.IDispatch, parent *ole.IDispatch, d
 	}
 	defer arr.Release()
 
+	type childMeta struct {
+		elem       *ole.IDispatch
+		name, ctrl string
+		autoID     string
+		x, y, w, h int
+		visible    bool
+	}
+
 	count := uiaArrayLength(arr)
+	kids := make([]childMeta, 0, count)
 	for i := 0; i < count; i++ {
 		child := uiaArrayGetElement(arr, i)
 		if child == nil {
 			continue
 		}
-
 		x, y, w, h := uiaElementGetBoundingRect(child)
-		visible := w > 0 && h > 0
-		_ = x
-		_ = y
+		meta := childMeta{elem: child, x: x, y: y, w: w, h: h, visible: w > 0 && h > 0}
+		// Name/type/automation-id are cross-process COM reads. Semantic walks
+		// need them for every sibling (ordinals count skipped ones too, so an
+		// element's ordinal does not shift when a sibling becomes visible);
+		// a plain walk needs them only for the elements it emits.
+		if semantic || meta.visible || includeInvisible {
+			meta.name = truncateRunes(uiaElementGetPropertyStr(child, UIA_NamePropertyId), 100)
+			meta.ctrl = controlTypeName(uiaElementGetPropertyInt(child, UIA_ControlTypePropertyId))
+			meta.autoID = uiaElementGetPropertyStr(child, UIA_AutomationIdPropertyId)
+		}
+		kids = append(kids, meta)
+	}
 
-		if visible || includeInvisible {
-			id := state.cache.add(child)
-			info := buildElementInfo(child, id, depth)
+	// Ordinal disambiguates same-signature siblings (third "row" in a list).
+	ordCount := map[string]int{}
+	for _, k := range kids {
+		ord := ordCount[k.ctrl+"|"+k.name]
+		ordCount[k.ctrl+"|"+k.name]++
+
+		if k.visible || includeInvisible {
+			id := state.cache.add(k.elem)
+			info := buildElementInfoPrefetched(k.elem, id, depth, k.name, k.ctrl, k.autoID, k.x, k.y, k.w, k.h)
+			if semantic {
+				info["path"] = path
+				info["ordinal"] = ord
+				info["sig"] = semanticSig(k.ctrl, k.name, k.autoID, path, ord)
+			}
 			*results = append(*results, info)
 		}
 
-		walkTree(state, trueCond, child, depth+1, maxDepth, includeInvisible, results)
+		childName := truncateRunes(k.name, 40)
+		childPath := path
+		if semantic {
+			childPath = append(append([]map[string]any{}, path...), map[string]any{"role": k.ctrl, "name": childName})
+		}
+		walkTree(state, trueCond, k.elem, depth+1, maxDepth, includeInvisible, semantic, childPath, results)
 
-		if !visible && !includeInvisible {
-			child.Release()
+		if !k.visible && !includeInvisible {
+			k.elem.Release()
 		}
 	}
 }
 
-// uiaInspect performs a tree inspection and returns the result map.
-func uiaInspect(state *uiaState, pid, maxDepth int, includeInvisible bool) (map[string]any, error) {
+// uiaInspect performs a tree inspection and returns the result map. With
+// semantic=true, elements additionally carry {path, ordinal, sig} — the
+// durable SemanticRef fields for the structural runtime.
+func uiaInspect(state *uiaState, pid, maxDepth int, includeInvisible, semantic bool) (map[string]any, error) {
 	pid, err := resolvePid(pid)
 	if err != nil {
 		return nil, err
@@ -618,10 +669,16 @@ func uiaInspect(state *uiaState, pid, maxDepth int, includeInvisible bool) (map[
 	}
 	defer trueCond.Release()
 
-	var elements []map[string]any
-	walkTree(state, trueCond, window, 0, maxDepth, includeInvisible, &elements)
-
 	windowTitle := uiaElementGetPropertyStr(window, UIA_NamePropertyId)
+
+	var rootPath []map[string]any
+	if semantic {
+		rootName := truncateRunes(windowTitle, 40)
+		rootPath = []map[string]any{{"role": "Window", "name": rootName}}
+	}
+
+	var elements []map[string]any
+	walkTree(state, trueCond, window, 0, maxDepth, includeInvisible, semantic, rootPath, &elements)
 
 	return map[string]any{
 		"window_title":  windowTitle,
