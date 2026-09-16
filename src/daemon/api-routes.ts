@@ -9,6 +9,7 @@ import { createHmac, timingSafeEqual } from 'node:crypto';
 import { DEBUG_RPC_HEADER, debugRpcGate, debugRpcTokenMatches } from './debug-rpc-gate.ts';
 import type { HealthMonitor } from './health.ts';
 import { applyApprovalDecision } from './approval-decision.ts';
+import { createWorkItemRoutes } from '../goals/work-item-routes.ts';
 import { isPermissionName, readSystemPermissions, requestSystemPermission } from './system-permissions.ts';
 import { PANEL_SESSION_COOKIE } from '../sidecar/panel-sessions.ts';
 import { getCookie } from '../util/cookie.ts';
@@ -4074,10 +4075,13 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
       GET: () => {
         try {
           const goals = require('../vault/goals.ts');
+          // Keep the legacy goal-row contract; Today uses /api/work-items?today=true.
           return json(goals.findGoals({ level: 'daily_action', status: 'active', limit: 20 }));
         } catch (err) { return error(`${err}`); }
       },
     },
+
+    ...createWorkItemRoutes(json),
 
     '/api/goals/:id': {
       GET: (req: Request) => {

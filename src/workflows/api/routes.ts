@@ -56,6 +56,8 @@ import {
 } from "../db/repos/flow-run";
 import { enqueue } from "../db/repos/job-queue";
 import { cancelFlowRun } from "../db/repos/run-cancellation";
+import { startWorkItemRun } from "../../goals/workflow-bridge";
+import { WorkItemError } from "../../goals/work-items";
 import {
   getWaitpoint,
   listWaitpointsByFlowRun,
@@ -989,7 +991,18 @@ export function createWorkflowRoutes(opts: CreateWorkflowRoutesOptions = {}): Wo
             triggeredBy?: string;
             stepNameToTest?: string;
             payload?: Record<string, unknown>;
+            workItemId?: string;
           };
+          // Linked work runs on the version and input frozen by its decision,
+          // so no other field may accompany it.
+          if (body.workItemId !== undefined) {
+            if (typeof body.workItemId !== "string" || !body.workItemId) return err("workItemId must be a non-empty string", 400);
+            if (Object.keys(body).some((key) => key !== "workItemId")) {
+              return err("Linked work uses its accepted version and input; only workItemId is allowed", 400);
+            }
+            try { return ok(startWorkItemRun(body.workItemId, id), 202); }
+            catch (e) { if (e instanceof WorkItemError) return err(e.message, e.status); throw e; }
+          }
           // Version selection:
           //   - Test-from-here (stepNameToTest set): prefer DRAFT. The user
           //     is iterating on step definitions + sample data in the editor,
