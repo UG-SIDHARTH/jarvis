@@ -9,6 +9,7 @@
 
 import type { Database } from "bun:sqlite";
 import { getRunCancellation, type RunCancellation } from "./run-cancellation";
+import { getRunMachineBinding, type RunMachineBinding } from "./run-machine-binding";
 import { getWorkflowDb, DEFAULT_IDS } from "../index";
 import { apId } from "../ids";
 
@@ -103,6 +104,7 @@ export interface FailedStep {
 }
 
 export interface FlowRun {
+  machineBinding: RunMachineBinding | null;
   cancellation: RunCancellation | null;
   id: string;
   flowId: string;
@@ -160,6 +162,7 @@ function now(): number {
 
 function rowToRun(row: FlowRunRow): FlowRun {
   return {
+    machineBinding: getRunMachineBinding(row.id),
     cancellation: getRunCancellation(row.id),
     id: row.id,
     flowId: row.flow_id,
