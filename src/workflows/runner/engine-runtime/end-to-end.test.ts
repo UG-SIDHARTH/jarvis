@@ -8,10 +8,12 @@
  */
 
 import { test, expect, describe, beforeAll, afterAll } from "bun:test";
-import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { closeWorkflowDb, initWorkflowDb } from "../../db";
-import { createFlow } from "../../db/repos/flow";
+import { createFlow, setFlowCodeStepsEnabled } from "../../db/repos/flow";
+import { publishFlowVersion } from "../../db/repos/flow-publication";
 import {
   createDraftVersion,
   getFlowVersion,
@@ -459,6 +461,100 @@ describe("Engine end-to-end (G+H pieces)", () => {
       expect(calls.agent[0]?.goal).toBe("say hi");
       expect(calls.workflows.length).toBe(1);
       expect(calls.workflows[0]?.flowId).toBe("flow_other");
+    },
+    60_000,
+  );
+
+  /**
+   * The CODE-step gate against the real engine (#467 item 3).
+   *
+   * Two halves that only mean something together: publish REFUSES the flow
+   * while the per-flow opt-in is missing, and the exact same flow runs a real
+   * CODE step to SUCCEEDED once the opt-in is there. That is also the proof
+   * behind grandfathering -- the upgrade writes this grant onto a flow that was
+   * already running a CODE step, and this is what having the grant buys.
+   */
+  test.skipIf(skipE2eTests)(
+    "a CODE step is refused at publish without the per-flow opt-in, and runs once it has it",
+    async () => {
+      // The CODE step writes to an absolute path outside the flow's world.
+      // That is the privilege the gate exists for -- a child process, not an
+      // isolate -- and it doubles as the only out-of-band proof available
+      // here that the step really executed: `executeFlow` leaves
+      // `flow_run.steps` null (the worker handler is what accumulates step
+      // outputs), so a SUCCEEDED status alone could not tell a step that ran
+      // from a step that was skipped.
+      const probeDir = mkdtempSync(join(tmpdir(), "jarvis-code-gate-"));
+      const probe = join(probeDir, "doubled.txt");
+      const flow = createFlow({ projectId: DEFAULT_IDS.project });
+      const trigger: FlowTriggerNode = {
+        name: "trigger",
+        type: "PIECE_TRIGGER",
+        displayName: "Manual",
+        settings: {
+          pieceName: PIECE_TEST_NAME,
+          pieceVersion: PIECE_VERSION,
+          triggerName: "manual",
+          input: { payload: { n: 21 } },
+        },
+        nextAction: {
+          name: "loop_1",
+          type: "LOOP_ON_ITEMS",
+          displayName: "Once",
+          settings: { items: "{{ [1] }}" },
+          // Inside a LOOP body, so this also exercises the nested case against
+          // the real executor rather than only against the scanner.
+          firstLoopAction: {
+            name: "double_it",
+            type: "CODE",
+            displayName: "Double it",
+            settings: {
+              input: { n: 21 },
+              sourceCode: {
+                packageJson: "{}",
+                code:
+                  "exports.code = async (inputs) => {" +
+                  `  require('node:fs').writeFileSync(${JSON.stringify(probe)}, String(Number(inputs.n) * 2));` +
+                  "  return { doubled: Number(inputs.n) * 2 };" +
+                  "};",
+              },
+            },
+          },
+        },
+      };
+      const v = createDraftVersion({ flowId: flow.id, displayName: "code-gate", trigger });
+      updateDraftVersion(v.id, { trigger, valid: true });
+
+      // Refused while the flow has no opt-in, and nothing is committed.
+      expect(() => publishFlowVersion(flow.id)).toThrow("Enable code steps for this flow to publish");
+      expect(getFlowVersion(v.id)!.state).toBe("DRAFT");
+
+      setFlowCodeStepsEnabled(flow.id, true);
+      const published = publishFlowVersion(flow.id);
+      expect(published.version.state).toBe("LOCKED");
+
+      const run = createFlowRun({
+        flowId: flow.id,
+        flowVersionId: published.version.id,
+        environment: "TESTING",
+      });
+      const handle = await runtime!.acquire({ runId: run.id, projectId: DEFAULT_IDS.project });
+      let stderrBuf = "";
+      handle.stderr?.on("data", (d) => { stderrBuf += d.toString(); });
+      try {
+        const finalRun = await handle.executeFlow({ flowVersion: getFlowVersion(published.version.id)! });
+        if (finalRun.status !== "SUCCEEDED") {
+          console.error(`[engine stderr]\n${stderrBuf.slice(0, 4000)}`);
+        }
+        expect(finalRun.status).toBe("SUCCEEDED");
+        // SUCCEEDED on its own would also pass if the engine had skipped the
+        // CODE step inside the loop body, so read the probe the step wrote.
+        expect(readFileSync(probe, "utf8")).toBe("42");
+      } finally {
+        await handle.release();
+        rmSync(probeDir, { recursive: true, force: true });
+      }
+      expect(getFlowRun(run.id)?.status).toBe("SUCCEEDED");
     },
     60_000,
   );

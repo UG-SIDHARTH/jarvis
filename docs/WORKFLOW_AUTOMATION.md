@@ -125,7 +125,9 @@ What this does NOT do:
   runnable exactly as before; a piece with no adapter is reported ungoverned and
   the step proceeds untouched. The verified set grows by landing an adapter.
 - It does not govern `CODE` steps, which run in a spawned child process with host
-  privileges and make their own calls. That is tracked separately in #467.
+  privileges and make their own calls. They are not governed, they are gated:
+  a flow containing one is refused at publish unless CODE was enabled for that
+  flow. See `CODE steps need a per-flow opt-in` above.
 - It does not make the daemon the caller. The piece's own HTTPS request still
   happens in the engine subprocess after the daemon authorizes it, so the
   recorded outcome is a dispatch authorization, not a delivery receipt. The gate
@@ -133,6 +135,107 @@ What this does NOT do:
   built for; it does not hold against a malicious piece, which is why it covers
   only pieces that have been read and vetted.
 - It does not cover triggers. Polling triggers run on a different engine path.
+
+### `CODE` steps need a per-flow opt-in
+
+A `CODE` step is not a sandboxed expression and not an isolate. The engine
+writes the step's `sourceCode` bundle to disk and runs it in the engine
+subprocess: `AP_EXECUTION_MODE=SANDBOX_PROCESS` is a CHILD PROCESS, so that
+JavaScript has every privilege the daemon's user has -- the whole filesystem,
+the network, the shell. None of it comes back through the daemon, so none of it
+is visible to the Authority boundary above. That is the whole reason for the
+gate: a flow is not always hand-authored, `manage_workflow compose` builds a
+`FlowVersion` out of an LLM plan, and LLM output is untrusted here.
+
+So CODE is off by default, and the permission is granted PER FLOW:
+
+```
+POST /api/workflows/<flowId>/code-steps   {"enabled": true}
+```
+
+A global switch would be the wrong shape: turning CODE on for one automation
+would turn it on for every flow composed afterwards, which is the thing the
+gate exists to prevent.
+
+The refusal happens at AUTHORING time, never per execution:
+
+- `POST /api/workflows/:id/publish` and `manage_workflow publish` refuse with
+  403 and change nothing -- the version is not locked, not attached, and the
+  flow is not enabled.
+- Enabling a flow refuses the same way (`PATCH /api/workflows/:id` with
+  `status: "ENABLED"`, `manage_workflow enable`), because the trigger manager
+  registers an ENABLED flow's cron against `published ?? latest draft`: without
+  this, a flow could start firing on a schedule without ever being published.
+- Asking for a run directly refuses too (`POST /api/workflows/:id/run`,
+  `manage_workflow run`, and a nested `run_workflow` step). This is defence in
+  depth, not the primary gate, and it can only ever refuse an UNPUBLISHED
+  draft: publish already requires the grant, so a published flow carries it.
+- Writing a CODE step INTO the draft an ENABLED flow is already running is
+  refused as well. A flow that is ENABLED with nothing published runs its
+  latest draft, and a draft row is mutated in place, so that save is a deploy:
+  without this the graph behind a registered cron could pick up a CODE step
+  after the enable gate had passed. `createDraftVersion` and
+  `updateDraftVersion` are the only two writers of `flow_version.trigger`, so
+  both carry the check. Editing a draft on a DISABLED flow, or on one that has
+  a published version, stays completely free -- publish is still ahead of it.
+- Finally, `TriggerManager` declines to register a subscription for a version
+  with an ungranted CODE step, and logs why. Registration happens at boot and
+  on refresh, not per execution, so this is not #459's run-time refusal; it is
+  the backstop for the one thing the authoring gates cannot see, namely that
+  "latest draft" moves with any write that bumps a draft's `updated`, so a
+  CODE draft that was not live when the flow was enabled can become live
+  later. A published flow always carries the grant, so this can only ever
+  decline a flow that was never publishable.
+
+Nothing is refused per execution. That was the flaw in the allowlist cut from
+#459: it refused at run time, so a cron- or webhook-triggered flow published
+successfully and then failed on every fire with nobody there to read why.
+
+The message names what was refused, which step caused it, and the call that
+grants the permission. A CODE step is found wherever it is -- the walker in
+`src/workflows/db/flow-graph.ts` follows `nextAction`, a LOOP's
+`firstLoopAction` and every ROUTER branch in `children`, so a step parked
+inside a loop or behind a branch is not missed.
+
+**Existing flows are grandfathered, visibly.** On the first boot that adds the
+column, any flow that is already runnable (ENABLED, or carrying a published
+version) whose runnable version actually contains a CODE step gets the
+permission, stamped `grantedBy: "upgrade"`. An automation that has been running
+a CODE step on a cron for months does not stop because the daemon restarted on
+a newer build, and the grant is not silent: `GET /api/workflows` reports
+`codeSteps: { enabled, grantedBy, grantedAt }` per flow, so the dashboard can
+say the permission was inherited rather than chosen, and the user can revoke it
+with `{"enabled": false}`. Every other flow -- including one holding an
+unpublished CODE draft -- starts at OFF.
+
+Revoking with `{"enabled": false}` takes the permission away from the next
+publish, enable, run or draft write, and from the next trigger registration --
+so a live schedule keeps firing until the daemon restarts or the flow is
+refreshed, and then stops. It does not unpublish the version and it does not
+stop a run already in flight. Disabling the flow is what stops a schedule
+immediately. The grant is not handed back later: the upgrade backfill is keyed
+on the columns being introduced, so a revoked permission stays revoked across
+restarts. The other side of that key is that a build rolled back below this
+version and then rolled forward again will not re-grandfather a flow published
+in between; such a flow needs the opt-in like any other.
+
+Three deliberate omissions:
+
+- `manage_workflow` has no action that grants the permission. The threat is an
+  untrusted LLM-authored `FlowVersion`; a tool action that let the model grant
+  itself CODE would be the gate writing its own exception.
+- Piece admission is untouched. All 657 catalogue entries stay installable and
+  runnable. This gate is CODE steps only.
+- A linked work item (`startWorkItemRun`, `src/goals/workflow-bridge.ts`) is not
+  gated. It runs one LOCKED version that the user personally accepted on an
+  approval card, which is a per-version consent signal stronger than the
+  per-flow flag, and gating it would break an accepted proposal mid-flight on
+  upgrade.
+
+Also worth knowing: `manage_workflow compose` cannot emit a CODE step at all.
+Its validator accepts `PIECE`, `LOOP_ON_ITEMS` and `ROUTER` for action steps
+and nothing else, so the LLM path produces CODE-free flows and the gate is
+never in the composer's way.
 
 ### `{{ ... }}` expressions are data, not JavaScript
 
@@ -496,10 +599,11 @@ Mounted under `/api/workflows/*`. Source: `src/workflows/api/routes.ts`.
 | GET | `/api/workflows/:id/versions` | Version history |
 | POST | `/api/workflows/:id/versions` | New draft version |
 | GET | `/api/workflows/:id/versions/:vid` | Get version |
-| POST | `/api/workflows/:id/versions/:vid/lock` | Publish + register triggers |
+| POST | `/api/workflows/:id/versions/:vid/lock` | Freeze a draft (DRAFT -> LOCKED). Does not publish and does not refresh triggers |
 | POST | `/api/workflows/:id/versions/:vid/sample-data/:step` | Set per-step sample output |
 | POST | `/api/workflows/:id/versions/:vid/sample-input/:step` | Set per-step sample input override |
-| POST | `/api/workflows/:id/publish` | Publish latest draft |
+| POST | `/api/workflows/:id/publish` | Publish latest draft (403 when the version has a CODE step and CODE is off for the flow) |
+| POST | `/api/workflows/:id/code-steps` | Grant or revoke this flow's CODE-step permission (`{"enabled": bool}`) |
 | POST | `/api/workflows/:id/run` | Enqueue run; accepts `stepNameToTest` for run-from-here |
 | GET | `/api/workflows/:id/runs` | Run history |
 | GET | `/api/workflows/pieces` | Engine-extracted catalog |
