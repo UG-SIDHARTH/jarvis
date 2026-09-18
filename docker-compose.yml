@@ -8,6 +8,8 @@ services:
     restart: unless-stopped
     ports:
       - "3142:3142"
+    environment:
+      - JARVIS_PUBLIC_URL=https://jarvis.ugsidharth.in
     volumes:
       - jarvis-data:/data
     # Resource limit tailored for 4 GB RAM laptops:
