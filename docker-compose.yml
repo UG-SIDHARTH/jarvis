@@ -10,8 +10,10 @@ services:
       - "3142:3142"
     environment:
       - JARVIS_PUBLIC_URL=https://jarvis.ugsidharth.in
+      - JARVIS_INSECURE_OPEN_ACCESS=true
     volumes:
       - jarvis-data:/data
+      - ./config.yaml:/data/.jarvis/config.yaml
     # Resource limit tailored for 4 GB RAM laptops:
     deploy:
       resources:

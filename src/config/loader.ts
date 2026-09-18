@@ -121,6 +121,13 @@ export function applyEnvOverrides(config: JarvisConfig): void {
     const v = env.JARVIS_REALTIME_VOICE.trim().toLowerCase();
     config.voice.realtime.enabled = v !== '' && v !== '0' && v !== 'false' && v !== 'no';
   }
+
+  // First-time setup escape hatch: allow dashboard access without device token
+  if (env.JARVIS_INSECURE_OPEN_ACCESS !== undefined) {
+    if (!config.auth) config.auth = {};
+    const v = env.JARVIS_INSECURE_OPEN_ACCESS.trim().toLowerCase();
+    config.auth.insecure_open_access = v === '1' || v === 'true' || v === 'yes';
+  }
 }
 
 export async function loadConfig(configPath?: string): Promise<JarvisConfig> {
