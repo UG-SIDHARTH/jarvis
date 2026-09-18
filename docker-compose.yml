@@ -1,0 +1,27 @@
+services:
+  jarvis:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: jarvis:local
+    container_name: jarvis
+    restart: unless-stopped
+    ports:
+      - "3142:3142"
+    volumes:
+      - jarvis-data:/data
+    # Resource limit tailored for 4 GB RAM laptops:
+    deploy:
+      resources:
+        limits:
+          memory: 1024M
+    healthcheck:
+      test: ["CMD-SHELL", "bun -e \"fetch('http://localhost:3142/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  jarvis-data:
+    name: jarvis-data
