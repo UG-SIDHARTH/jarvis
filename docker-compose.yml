@@ -13,6 +13,7 @@ services:
       - JARVIS_INSECURE_OPEN_ACCESS=true
     volumes:
       - jarvis-data:/data
+      - ./config.yaml:/data/config.yaml
       - ./config.yaml:/data/.jarvis/config.yaml
     # Resource limit tailored for 4 GB RAM laptops:
     deploy:

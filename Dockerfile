@@ -97,6 +97,7 @@ RUN ln -s /app/bin/jarvis.ts /usr/local/bin/jarvis
 RUN groupadd -r jarvis && useradd -r -g jarvis -d /data -s /bin/bash jarvis && \
     mkdir -p /data && chown jarvis:jarvis /data
 
+ENV HOME=/data
 ENV JARVIS_HOME=/data
 ENV NODE_ENV=production
 # Signal to `jarvis update` / `jarvis uninstall` that this is a container

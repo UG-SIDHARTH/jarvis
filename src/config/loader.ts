@@ -130,8 +130,37 @@ export function applyEnvOverrides(config: JarvisConfig): void {
   }
 }
 
+/**
+ * Resolve the path to config.yaml across candidate locations:
+ * 1. Explicit configPath parameter
+ * 2. JARVIS_CONFIG_PATH environment variable
+ * 3. Paths under $JARVIS_HOME (config.yaml, config.yml, .jarvis/config.yaml)
+ * 4. ~/.jarvis/config.yaml or ~/.jarvis/config.yml
+ */
+export async function resolveConfigFile(configPath?: string): Promise<string> {
+  if (configPath) return configPath;
+  if (process.env.JARVIS_CONFIG_PATH) return process.env.JARVIS_CONFIG_PATH;
+
+  const candidates: string[] = [];
+  if (process.env.JARVIS_HOME) {
+    candidates.push(join(process.env.JARVIS_HOME, 'config.yaml'));
+    candidates.push(join(process.env.JARVIS_HOME, 'config.yml'));
+    candidates.push(join(process.env.JARVIS_HOME, '.jarvis', 'config.yaml'));
+    candidates.push(join(process.env.JARVIS_HOME, '.jarvis', 'config.yml'));
+  }
+  candidates.push(expandTilde('~/.jarvis/config.yaml'));
+  candidates.push(expandTilde('~/.jarvis/config.yml'));
+
+  for (const candidate of candidates) {
+    if (await Bun.file(candidate).exists()) {
+      return candidate;
+    }
+  }
+  return candidates[0]!;
+}
+
 export async function loadConfig(configPath?: string): Promise<JarvisConfig> {
-  const path = configPath || expandTilde('~/.jarvis/config.yaml');
+  const path = await resolveConfigFile(configPath);
 
   const file = Bun.file(path);
   const exists = await file.exists();
@@ -234,7 +263,7 @@ export async function loadConfig(configPath?: string): Promise<JarvisConfig> {
 export async function readRawConfigFile(
   configPath?: string,
 ): Promise<Record<string, unknown> | null> {
-  const path = configPath || expandTilde('~/.jarvis/config.yaml');
+  const path = await resolveConfigFile(configPath);
   const file = Bun.file(path);
   if (!(await file.exists())) return null;
   const doc = YAML.parseDocument(await file.text(), { merge: true });
