@@ -4144,6 +4144,13 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     settingsReload.registerApplier('llm', async (cfg) => {
       const { hotReloadLLMProviders } = await import('./llm-settings.ts');
       hotReloadLLMProviders(cfg, agentService.getLLMManager());
+      // `mergeLLMSettingsIntoConfig` REPLACES `config.llm.providers` rather
+      // than mutating it, so the orchestrator's boot-time reference is
+      // detached on every reload. Re-hand it, or the tool filter keeps
+      // classifying provider kinds from a snapshot that no longer matches
+      // the tier map it is being asked about -- and a provider re-pointed
+      // from a local endpoint to a remote one would still read as local.
+      agentService.getOrchestrator().setToolFilterProviders(cfg.llm?.providers);
     });
 
     // authority — keep the engine's construction-time snapshot in sync on a
@@ -4803,6 +4810,22 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     await registry.startAll();
 
     // 10a-post. Wire authority components that need running services
+    // Tool relevance filtering (docs/tool-relevance-filtering.md). Resolved
+    // once here from the SYSTEM-owned `tools:` config section plus
+    // JARVIS_TOOL_FILTER; absent config means OFF, and `=off` beats
+    // everything. Only the POLICY is frozen -- which model a tier resolves
+    // to is classified per call, because `llm` is hot-reloadable.
+    {
+      const { toolFilterPolicyFromConfig, setToolFilterPolicy } = await import('../actions/tools/tool-relevance/policy.ts');
+      const policy = toolFilterPolicyFromConfig(jarvisConfig);
+      setToolFilterPolicy(policy);
+      orchestrator.setToolFilterProviders(jarvisConfig.llm?.providers);
+      if (policy.enabled) {
+        console.warn('[Daemon] Tool relevance filtering is ON. It is default-off and '
+          + 'unbenchmarked; set JARVIS_TOOL_FILTER=off to disable.');
+      }
+    }
+
     const toolRegistry = orchestrator.getToolRegistry();
     if (toolRegistry) {
       deferredExecutor.setToolRegistry(toolRegistry);

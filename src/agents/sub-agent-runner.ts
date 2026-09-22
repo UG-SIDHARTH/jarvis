@@ -19,8 +19,14 @@
 import type { AgentInstance } from './agent.ts';
 import type { LLMManager } from '../llm/manager.ts';
 import type { LLMMessage, LLMResponse, LLMToolCall, LLMTool } from '../llm/provider.ts';
-import { ToolRegistry } from '../actions/tools/registry.ts';
+import { ToolRegistry, type ToolDefinition } from '../actions/tools/registry.ts';
 import { checkpointExecution } from '../actions/execution-scope.ts';
+import type { TierMap } from '../llm/tiers.ts';
+import type { LLMProviderEntry } from '../config/types.ts';
+import { decideTools } from '../actions/tools/tool-relevance/filter.ts';
+import { DISCOVER_TOOLS, ToolExposureLedger } from '../actions/tools/tool-relevance/ledger.ts';
+import { interceptDiscovery, DISCOVER_TOOLS_LLM } from '../actions/tools/tool-relevance/discover.ts';
+import { getToolFilterPolicy } from '../actions/tools/tool-relevance/policy.ts';
 import { toolDefToLLMTool, BUILTIN_TOOLS } from '../actions/tools/builtin.ts';
 import type { ActionCategory } from '../roles/authority.ts';
 import type { AuthorityEngine, AuthorityProfile } from '../authority/engine.ts';
@@ -161,6 +167,14 @@ export type RunSubAgentOptions = {
   context: string;
   llmManager: LLMManager;
   toolRegistry: ToolRegistry;
+  /**
+   * Provider entries from the post-DB-merge `llm` config, for the tool
+   * filter's model-class gate. Absent means the classifier reads a
+   * provider's KIND from its NAME, which is right for the canonical
+   * entries and fails closed (ineligible, so unfiltered) for custom-named
+   * ones -- so a custom-named ollama instance simply never filters here.
+   */
+  toolFilterProviders?: Record<string, LLMProviderEntry | undefined>;
   onProgress?: ProgressCallback;
   maxIterations?: number;
   // Authority engine components (optional — if not provided, no gate applied)
@@ -215,11 +229,65 @@ function buildSubAgentPromptParts(agent: AgentInstance, context: string): { stat
 }
 
 /**
- * Get LLM-formatted tools from a scoped ToolRegistry.
+ * Get LLM-formatted tools from a scoped ToolRegistry, with the relevance
+ * filter applied.
+ *
+ * This site matters more than it looks. The scoped registry for the DEFAULT
+ * delegation target, `research-analyst`, is `[browser, terminal, file-ops]`
+ * -- all ten browser tools plus `run_command`, `read_file`, `write_file` and
+ * `list_directory`. That is precisely the "drop the browser group, keep the
+ * shell" shape #475 was rejected for, so the coupling invariant is more
+ * load-bearing here than on the main agent, not less.
+ *
+ * Note the other direction too: some scoped registries have no framed
+ * perception tool at all (`software-engineer` is terminal + file-ops). The
+ * invariant is quantified over what the call site registered, so retaining
+ * the shell there is that agent's status quo rather than a regression -- and
+ * the filter must never add a tool the registry does not contain.
  */
-function getLLMTools(registry: ToolRegistry): LLMTool[] | undefined {
-  if (registry.count() === 0) return undefined;
-  return registry.list().map(toolDefToLLMTool);
+/**
+ * The tier map, if this manager has one.
+ *
+ * The filter must never be able to break a call site. Embedded and test
+ * callers pass a minimal LLM manager stub with only `chatTier` on it, and an
+ * unguarded `llmManager.getTierMap()` turns "no optimisation" into "the
+ * sub-agent throws before its first turn". An absent map means no tier
+ * resolves, which the eligibility gate reads as ineligible -- unfiltered,
+ * which is the correct fallback.
+ */
+function tierMapOf(manager: LLMManager): TierMap {
+  const fn = (manager as Partial<LLMManager>).getTierMap;
+  if (typeof fn !== 'function') return {};
+  try {
+    return fn.call(manager) ?? {};
+  } catch {
+    return {};
+  }
+}
+
+function getLLMTools(
+  registry: ToolRegistry,
+  messages: readonly LLMMessage[],
+  ledger: ToolExposureLedger,
+  tiers: TierMap,
+  providers: Record<string, LLMProviderEntry | undefined> | undefined,
+): { llm: LLMTool[] | undefined; exposed: ReadonlySet<string> } {
+  if (registry.count() === 0) return { llm: undefined, exposed: new Set() };
+  const all = registry.list();
+  const decision = decideTools({
+    all,
+    messages,
+    ledger,
+    // The sub-agent loop always runs on the medium tier (see chatTier below).
+    tier: 'medium',
+    tiers,
+    providers,
+  });
+  // DISCOVER_TOOLS_LLM rather than the converted definition:
+  // toolDefToLLMTool drops `items` from an array parameter.
+  const llm = decision.tools.map((t) =>
+    (t.name === DISCOVER_TOOLS ? DISCOVER_TOOLS_LLM : toolDefToLLMTool(t)));
+  return { llm, exposed: decision.exposed };
 }
 
 type AuthorityContext = {
@@ -394,6 +462,7 @@ export async function runSubAgent(opts: RunSubAgentOptions): Promise<SubAgentRes
     context,
     llmManager,
     toolRegistry,
+    toolFilterProviders,
     onProgress,
     maxIterations = MAX_TOOL_ITERATIONS,
     authorityEngine,
@@ -447,7 +516,13 @@ export async function runSubAgent(opts: RunSubAgentOptions): Promise<SubAgentRes
     ];
   }
 
-  const tools = getLLMTools(toolRegistry);
+  // The sub-agent buffer IS durable -- `state()` captures it whole into the
+  // checkpoint and `resume.messages` restores it -- so the ledger can be
+  // seeded from it and admissions survive a pause.
+  const exposure = new ToolExposureLedger();
+  exposure.seedFromMessages(resume?.messages, (n) => toolRegistry.has(n));
+  let toolSet = getLLMTools(toolRegistry, messages, exposure, tierMapOf(llmManager), toolFilterProviders);
+  let tools = toolSet.llm;
   let finalText = '';
   let reachedFinal = false;
 
@@ -483,16 +558,69 @@ export async function runSubAgent(opts: RunSubAgentOptions): Promise<SubAgentRes
   };
 
   /** Dispatch a turn's tool calls in order; a pause returns what was not reached. */
+  /** Set when a discover_tools admission widened the exposed set. */
+  let exposureWidened = false;
+
+  /** Recompute the offered set after an admission, and only after one. */
+  const refreshToolsIfWidened = () => {
+    if (!exposureWidened) return;
+    exposureWidened = false;
+    toolSet = getLLMTools(toolRegistry, messages, exposure, tierMapOf(llmManager), toolFilterProviders);
+    tools = toolSet.llm;
+  };
+
   const dispatchCalls = async (calls: LLMToolCall[], iteration: number): Promise<SubAgentPause | null> => {
     for (let index = 0; index < calls.length; index++) {
       const tc = calls[index]!;
       fence();
+      // The escape hatch is synthetic and never in the scoped registry, so
+      // it is answered here rather than dispatched. It carries no authority
+      // and touches nothing; admission only widens what the next provider
+      // call is offered, and the coupling invariant is re-checked then.
+      const discovery = interceptDiscovery(tc.name, tc.arguments, {
+        all: toolRegistry.list(),
+        ledger: exposure,
+        exposed: toolSet.exposed,
+        filterEnabled: getToolFilterPolicy().enabled,
+        // The same emergency predicate `executeTool` applies below. Without
+        // it a halted system would still enumerate its catalogue here, which
+        // is the one thing this branch skips by sitting before dispatch.
+        haltedState: () =>
+          (authorityCtx?.emergencyController && !authorityCtx.emergencyController.canExecute()
+            ? authorityCtx.emergencyController.getState()
+            : null),
+        onAdmitted: (admitted) => {
+          try {
+            authorityCtx?.auditTrail?.log({
+              agent_id: agentId,
+              agent_name: agentName,
+              tool_name: `${DISCOVER_TOOLS}(${admitted.join(',')})`,
+              action_category: 'read_data',
+              authority_decision: 'allowed',
+              executed: true,
+            });
+          } catch (err) {
+            console.warn(`[SubAgent:${agentName}] could not audit a discover_tools admission:`,
+              err instanceof Error ? err.message : err);
+          }
+        },
+      });
+      if (discovery) {
+        if (discovery.grew) exposureWidened = true;
+        noteToolCall(tc);
+        sequence += 1;
+        record(tc, { text: discovery.result });
+        continue;
+      }
       noteToolCall(tc);
       sequence += 1;
       const dispatched = await executeTool(toolRegistry, tc, sequence, authorityCtx);
       if ('paused' in dispatched) {
         return { ...dispatched.paused, remaining: calls.slice(index + 1), iteration };
       }
+      // Whatever the sub-agent actually called stays exposed for the rest of
+      // the run -- registered names only, and only while the filter is on.
+      if (getToolFilterPolicy().enabled && toolRegistry.has(tc.name)) exposure.add(tc.name);
       record(tc, dispatched);
     }
     return null;
@@ -519,6 +647,13 @@ export async function runSubAgent(opts: RunSubAgentOptions): Promise<SubAgentRes
       // A turn is durable only while the run is still alive.
       fence();
       if (pause) return finish({ success: true, response: '', terminationReason: 'paused', paused: pause });
+      // A discover_tools call inside `pending.remaining` widens the set
+      // here, and the loop below calls the provider immediately. Without
+      // this the admission would only land one provider call later. Masked
+      // today because `seedFromMessages` also parses admissions out of
+      // `resume.messages`, which is exactly the kind of coupling nobody
+      // remembers when they change the other side.
+      refreshToolsIfWidened();
       startIteration = pending.iteration + 1;
       onTurn?.(state(startIteration));
     }
@@ -549,6 +684,7 @@ export async function runSubAgent(opts: RunSubAgentOptions): Promise<SubAgentRes
         // A turn is durable only while the run is still alive.
         fence();
         if (pause) return finish({ success: true, response: '', terminationReason: 'paused', paused: pause });
+        refreshToolsIfWidened();
         onTurn?.(state(iteration + 1));
         continue;
       }
