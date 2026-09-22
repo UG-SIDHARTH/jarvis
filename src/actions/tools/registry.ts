@@ -37,8 +37,10 @@ export function isToolResult(v: unknown): v is ToolResult {
  *                   a gate can raise a call, never lower it below the floor.
  *   intent          card-ready sentence naming what will actually happen,
  *                   with resolved values ("click Send (sends email)").
- *   confirm         'always': the person must confirm this call on a card
- *                   whatever the agent's level. 'above_level': a category the
+ *   confirm         'always': the person must confirm this call on a card;
+ *                   explicit denials still win. Like 'above_level', a pure
+ *                   level shortfall above a permitted floor can ask for approval.
+ *                   'above_level': a category the
  *                   agent's level cannot clear becomes an approval card instead
  *                   of a denial, the substitution request_approval makes for a
  *                   declared intent. Absent: the engine's decision stands.
@@ -84,6 +86,10 @@ export type ToolDefinition = {
    * force. Must be cheap and must not act.
    */
   authorityGate?: (params: Record<string, unknown>) => ToolGate | null;
+  /** Capture a read-only check of the UI session/subject a person will review.
+   * The returned guard lives only until this approval is resolved; it must
+   * never reconnect or select a replacement subject when validation fails. */
+  captureApprovalGuard?: (params: Record<string, unknown>) => (() => boolean);
 };
 
 export class ToolRegistry {
