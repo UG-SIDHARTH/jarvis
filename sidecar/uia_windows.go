@@ -38,6 +38,7 @@ const (
 	UIA_AutomationIdPropertyId        = 30011
 	UIA_ClassNamePropertyId           = 30012
 	UIA_IsPasswordPropertyId          = 30019
+	UIA_NativeWindowHandlePropertyId  = 30020
 	UIA_IsOffscreenPropertyId         = 30022
 )
 
@@ -231,6 +232,15 @@ type recordedElement struct {
 	Title   string
 	Value   string
 	HasVal  bool
+	// Owning process of the element itself.
+	Pid uint32
+	// Owning process of the top-level window the element sits in, and whether
+	// that window could be established at all. A WebView2 panel's controls
+	// belong to msedgewebview2.exe while the window that hosts them belongs
+	// to the sidecar, so this is what identifies Jarvis's own panels.
+	// HostKnown false means unknown, not "not ours": see ownWindowVerdict.
+	HostPid   uint32
+	HostKnown bool
 }
 
 // uiaElementFromPoint returns the element under a screen point.
@@ -252,6 +262,161 @@ func uiaElementFromPoint(automation *ole.IDispatch, x, y int) (*ole.IDispatch, e
 		return nil, fmt.Errorf("no element at point")
 	}
 	return elem, nil
+}
+
+// uiaElementFromHandle returns the element for a top-level window handle.
+func uiaElementFromHandle(automation *ole.IDispatch, hwnd uintptr) (*ole.IDispatch, error) {
+	var elem *ole.IDispatch
+	// IUIAutomation::ElementFromHandle = vtable[6]
+	hr, _, _ := syscall.SyscallN(
+		vtblOffset(automation, 6),
+		uintptr(unsafe.Pointer(automation)),
+		hwnd,
+		uintptr(unsafe.Pointer(&elem)),
+	)
+	if hr != 0 || elem == nil {
+		return nil, uiaOpError("ElementFromHandle", hr)
+	}
+	return elem, nil
+}
+
+// uiaHostingWindowPid reports the process that owns the top-level window
+// hosting elem, and whether that window could be established at all.
+//
+// This is what identifies one of Jarvis's own panels. A panel is a WebView2
+// control: its elements belong to msedgewebview2.exe while the window the
+// person sees belongs to the sidecar, so the element's own ProcessId never
+// recognises one. Reading NativeWindowHandle on a single ancestor is not
+// enough either -- not every element in the chain exposes one -- so this
+// tries elem itself and then each ancestor in turn, taking the first handle
+// that resolves through GA_ROOT to a real process.
+//
+// ok=false means "unknown", never "not ours": every caller that uses this to
+// decide what to record must drop the element rather than record it, because
+// an element with no hosting window cannot be shown NOT to be a panel.
+func uiaHostingWindowPid(walker, elem *ole.IDispatch) (uint32, bool) {
+	cur := elem
+	// Ancestors this function opened, released on the way out. elem itself is
+	// owned by the caller and must outlive us.
+	var opened []*ole.IDispatch
+	defer func() {
+		for _, e := range opened {
+			e.Release()
+		}
+	}()
+	for climb := 0; climb < 64; climb++ {
+		if hwnd := uiaElementGetPropertyInt(cur, UIA_NativeWindowHandlePropertyId); hwnd != 0 {
+			if pid := win32GetWindowPid(win32RootWindow(uintptr(hwnd))); pid != 0 {
+				return pid, true
+			}
+		}
+		parent, perr := uiaWalkerGetParent(walker, cur)
+		if perr != nil || parent == nil {
+			break
+		}
+		opened = append(opened, parent)
+		cur = parent
+	}
+	return 0, false
+}
+
+// maxOverlayDescendants bounds the fallback search below; a browser window
+// can expose tens of thousands of nodes and each rect read is a cross-process
+// call.
+const maxOverlayDescendants = 1500
+
+// uiaClickedElement resolves the element the person clicked at (x, y).
+//
+// A plain hit test returns the topmost window under the cursor, and on many
+// machines that is a transparent overlay (GPU vendor overlays, screen
+// recorders, remote-control layers) rather than the app that received the
+// click. When the hit-test element belongs to a process other than the
+// foreground window's, the click is attributed to the foreground window
+// instead: first its keyboard-focused element (a click usually focuses the
+// control it landed on), then the smallest descendant of that window whose
+// bounds contain the point.
+//
+// The own-window test happens HERE, on the element actually under the cursor,
+// before any of that re-attribution. It has to: a Jarvis panel is topmost but
+// need not be the foreground window, so its pid would differ from the
+// foreground window's and the re-attribution below would discard the panel
+// element and hand back a control of whatever app is foreground -- turning a
+// click the person made in Jarvis into a recorded step in their app. Testing
+// the returned element instead of the hit element cannot catch that, because
+// by then the panel element is gone. Returns errOwnWindow so the caller
+// drops the click.
+func uiaClickedElement(state *uiaState, walker *ole.IDispatch, x, y int) (*ole.IDispatch, error) {
+	hit, err := uiaElementFromPoint(state.automation, x, y)
+	if err != nil {
+		return nil, err
+	}
+	hitPid := uint32(uiaElementGetPropertyInt(hit, UIA_ProcessIdPropertyId))
+	hostPid, hostKnown := uiaHostingWindowPid(walker, hit)
+	if ownWindowVerdict(hitPid, hostPid, ownPid, hostKnown) {
+		hit.Release()
+		return nil, fmt.Errorf("%w: %s", errOwnWindow, ownWindowReason(hitPid, hostPid, ownPid, hostKnown))
+	}
+
+	fg := win32GetForegroundWindow()
+	fgPid := win32GetWindowPid(fg)
+	if fg == 0 || fgPid == 0 || hitPid == fgPid {
+		return hit, nil
+	}
+	overlay := processBaseName(hitPid)
+	hit.Release()
+
+	if focused, ferr := uiaGetFocusedElement(state.automation); ferr == nil {
+		if uint32(uiaElementGetPropertyInt(focused, UIA_ProcessIdPropertyId)) == fgPid {
+			return focused, nil
+		}
+		focused.Release()
+	}
+
+	window, werr := uiaElementFromHandle(state.automation, fg)
+	if werr != nil {
+		return nil, fmt.Errorf("click landed on %q, an overlay above the foreground window, and the window could not be read: %w", overlay, werr)
+	}
+	defer window.Release()
+	trueCond, cerr := uiaCreateTrueCondition(state.automation)
+	if cerr != nil {
+		return nil, cerr
+	}
+	defer trueCond.Release()
+	arr, aerr := uiaElementFindAll(window, TreeScope_Descendants, trueCond)
+	if aerr != nil || arr == nil {
+		return nil, fmt.Errorf("click landed on %q, an overlay above the foreground window; its tree could not be read", overlay)
+	}
+	defer arr.Release()
+	count := uiaArrayLength(arr)
+	if count > maxOverlayDescendants {
+		count = maxOverlayDescendants
+	}
+	var best *ole.IDispatch
+	bestArea := int64(-1)
+	for i := 0; i < count; i++ {
+		el := uiaArrayGetElement(arr, i)
+		if el == nil {
+			continue
+		}
+		ex, ey, ew, eh := uiaElementGetBoundingRect(el)
+		if ew <= 0 || eh <= 0 || x < ex || x >= ex+ew || y < ey || y >= ey+eh {
+			el.Release()
+			continue
+		}
+		area := int64(ew) * int64(eh)
+		if best == nil || area < bestArea {
+			if best != nil {
+				best.Release()
+			}
+			best, bestArea = el, area
+			continue
+		}
+		el.Release()
+	}
+	if best == nil {
+		return nil, fmt.Errorf("click landed on %q, an overlay above the foreground window, and no control of that window contains the point", overlay)
+	}
+	return best, nil
 }
 
 // uiaRawViewWalker returns IUIAutomation's raw-view tree walker, whose parent
@@ -323,23 +488,29 @@ var interactableControlTypes = map[string]bool{
 // control type and name. That is what makes the recorded sig equal the
 // live one, so the resolver's sig rung (1.0) re-finds the element at replay.
 func uiaRecordedElement(state *uiaState, kind string, x, y int) (*recordedElement, error) {
+	// The walker comes first: the click path needs it to find the window
+	// hosting the element under the cursor before it decides whether the
+	// click is even ours to record.
+	walker, err := uiaRawViewWalker(state.automation)
+	if err != nil {
+		return nil, err
+	}
+	defer walker.Release()
+
 	var elem *ole.IDispatch
-	var err error
 	if kind == "click" {
-		elem, err = uiaElementFromPoint(state.automation, x, y)
+		elem, err = uiaClickedElement(state, walker, x, y)
 	} else {
 		elem, err = uiaGetFocusedElement(state.automation)
 	}
 	if err != nil {
 		return nil, err
 	}
-	defer elem.Release()
-
-	walker, err := uiaRawViewWalker(state.automation)
-	if err != nil {
-		return nil, err
-	}
-	defer walker.Release()
+	// Closure, not `defer elem.Release()`: the climb below reassigns elem,
+	// and a method-value defer would capture the receiver as it is HERE --
+	// releasing the pre-climb element a second time (the loop already
+	// released it) and leaking the one we end up recording.
+	defer func() { elem.Release() }()
 
 	// Climb from a passive child (Text, Image, Group) to the control that
 	// owns it, so the ref addresses what the person meant to click.
@@ -371,8 +542,15 @@ func uiaRecordedElement(state *uiaState, kind string, x, y int) (*recordedElemen
 	rec.AutoID = uiaElementGetPropertyStr(elem, UIA_AutomationIdPropertyId)
 	rec.Secure = uiaElementGetPropertyBool(elem, UIA_IsPasswordPropertyId)
 	if pid := uiaElementGetPropertyInt(elem, UIA_ProcessIdPropertyId); pid > 0 {
+		rec.Pid = uint32(pid)
 		rec.App = processBaseName(uint32(pid))
 	}
+	// The window hosting the element, which is what identifies a Jarvis panel
+	// (the element's own process does not: a panel's controls are
+	// msedgewebview2.exe's). Resolved from elem rather than from the ancestor
+	// chain below, so an ancestor that exposes no native window handle does
+	// not silently leave this unknown.
+	rec.HostPid, rec.HostKnown = uiaHostingWindowPid(walker, elem)
 
 	// Ancestors from the immediate parent up to the top-level window. The
 	// desktop root (whose own parent is nil) is excluded, like the walk.
@@ -1230,6 +1408,7 @@ var (
 	kernel32                  = syscall.NewLazyDLL("kernel32.dll")
 	procGetForegroundWindow   = user32.NewProc("GetForegroundWindow")
 	procGetWindowThreadProcId = user32.NewProc("GetWindowThreadProcessId")
+	procGetAncestor           = user32.NewProc("GetAncestor")
 	procSetCursorPos          = user32.NewProc("SetCursorPos")
 	procMouseEvent            = user32.NewProc("mouse_event")
 	procSetForegroundWindow   = user32.NewProc("SetForegroundWindow")
@@ -1246,6 +1425,25 @@ func win32GetWindowPid(hwnd uintptr) uint32 {
 	var pid uint32
 	procGetWindowThreadProcId.Call(hwnd, uintptr(unsafe.Pointer(&pid)))
 	return pid
+}
+
+// gaRoot is GA_ROOT: walk up to the top-level window, stopping before the
+// desktop. Unlike GetParent it crosses the owner/child boundary the same way
+// the window manager does, so a child HWND inside a hosted control (a
+// WebView2 surface, say) resolves to the window the person actually sees.
+const gaRoot = 2
+
+// win32RootWindow returns the top-level window that hosts hwnd, or hwnd
+// itself when it is already top-level (or GetAncestor fails).
+func win32RootWindow(hwnd uintptr) uintptr {
+	if hwnd == 0 {
+		return 0
+	}
+	root, _, _ := procGetAncestor.Call(hwnd, gaRoot)
+	if root == 0 {
+		return hwnd
+	}
+	return root
 }
 
 const (

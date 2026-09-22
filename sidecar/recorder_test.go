@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -184,5 +186,98 @@ func TestRecorderCapIsClamped(t *testing.T) {
 	}
 	if got := recorderCapFromParams(map[string]any{"max_ms": float64(48 * 60 * 60 * 1000)}); got != recorderMaxCap {
 		t.Fatalf("above ceiling must clamp to %s, got %s", recorderMaxCap, got)
+	}
+}
+
+func TestRecorderEventsCarryTheEnvelopeTheBrainAccepts(t *testing.T) {
+	// The brain's validator (src/sidecar/validator.ts) rejects any frame whose
+	// type is not rpc_result, rpc_progress or sidecar_event, so a recorder
+	// event without the envelope is dropped before any listener sees it.
+	h := newRecorderHarness(t)
+	emitInteraction(map[string]any{"action": "click"})
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.events) != 1 {
+		t.Fatalf("expected one event, got %d", len(h.events))
+	}
+	ev := h.events[0]
+	if ev.Type != "sidecar_event" {
+		t.Fatalf("type must be sidecar_event, got %q", ev.Type)
+	}
+	if ev.EventType != "ui_interaction" {
+		t.Fatalf("event_type: %q", ev.EventType)
+	}
+	if ev.Timestamp == 0 {
+		t.Fatal("timestamp must be set")
+	}
+	if ev.Priority != "normal" {
+		t.Fatalf("priority: %q", ev.Priority)
+	}
+}
+
+func TestOwnWindowVerdictIdentifiesJarvisPanelsAndFailsClosed(t *testing.T) {
+	const own = uint32(4242)
+	const webview = uint32(9001) // msedgewebview2.exe hosting a panel's content
+	const otherApp = uint32(777)
+
+	cases := []struct {
+		name      string
+		elemPid   uint32
+		hostPid   uint32
+		hostKnown bool
+		want      bool
+	}{
+		// A native control of one of our own windows (the connect window).
+		{"own process", own, own, true, true},
+		// The reported defect: the chat panel is WebView2, so the element
+		// belongs to msedgewebview2.exe and only the hosting window is ours.
+		{"webview content hosted by our window", webview, own, true, true},
+		// An ordinary app: record it.
+		{"another app", otherApp, otherApp, true, false},
+		// A webview belonging to somebody else's app (Teams, Spotify): record it.
+		{"webview hosted by another app", webview, otherApp, true, false},
+		// Fail closed: an element whose hosting window could not be
+		// established cannot be shown NOT to be one of our panels.
+		{"unknown host", webview, 0, false, true},
+		{"unknown host, ordinary-looking element", otherApp, 0, false, true},
+	}
+	for _, c := range cases {
+		if got := ownWindowVerdict(c.elemPid, c.hostPid, own, c.hostKnown); got != c.want {
+			t.Errorf("%s: ownWindowVerdict(elem=%d, host=%d, own=%d, known=%v) = %v, want %v",
+				c.name, c.elemPid, c.hostPid, own, c.hostKnown, got, c.want)
+		}
+	}
+}
+
+func TestOwnWindowReasonNamesWhichOfTheTwoDropsItWas(t *testing.T) {
+	const own = uint32(4242)
+	// A drop the person should read as working as intended.
+	panel := ownWindowReason(9001, own, own, true)
+	if !strings.Contains(panel, "Jarvis's own window") {
+		t.Errorf("a panel drop must say so, got %q", panel)
+	}
+	// A drop caused by a UIA read this machine would not answer. Saying
+	// "Jarvis's own window" here would send someone looking in the wrong
+	// place for why their typing was ignored.
+	unknown := ownWindowReason(777, 0, own, false)
+	if strings.Contains(unknown, "Jarvis's own window") {
+		t.Errorf("an unreadable-host drop must not be reported as a panel, got %q", unknown)
+	}
+	if !strings.Contains(unknown, "hosting window could not be read") {
+		t.Errorf("an unreadable-host drop must say what failed, got %q", unknown)
+	}
+}
+
+func TestOwnWindowErrorIsDistinguishableFromACaptureFailure(t *testing.T) {
+	// The capture paths log a fault but drop an own-window element quietly,
+	// so the two must not be conflated.
+	if !errors.Is(errOwnWindow, errOwnWindow) {
+		t.Fatal("errOwnWindow must match itself")
+	}
+	if errors.Is(errors.New("ElementFromPoint failed"), errOwnWindow) {
+		t.Fatal("an unrelated capture failure must not read as an own-window drop")
+	}
+	if errors.Is(fmt.Errorf("wrapped: %w", errOwnWindow), errOwnWindow) != true {
+		t.Fatal("a wrapped errOwnWindow must still be recognised")
 	}
 }

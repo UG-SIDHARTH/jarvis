@@ -25,6 +25,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -80,6 +81,64 @@ func setRecorderIndicator(p PebbleService) {
 	recorderOpMu.Unlock()
 }
 
+// errOwnWindow marks an interaction that belongs to one of Jarvis's own
+// windows. It is not a capture failure -- the element was read fine and is
+// deliberately not recorded -- so the capture paths log it as an ignore
+// rather than a fault, and never as an empty result the caller has to guess
+// the meaning of.
+var errOwnWindow = errors.New("element belongs to one of Jarvis's own windows")
+
+// ownWindowVerdict decides whether an interaction must be dropped because it
+// belongs to one of Jarvis's own windows.
+//
+//   - elemPid is the process owning the element itself.
+//   - hostPid is the process owning the top-level window hosting it, and
+//     hostKnown says whether that window could be established at all.
+//   - ownPid is the sidecar's own process.
+//
+// elemPid alone never identifies a panel: the chat panel is a WebView2
+// control whose elements belong to msedgewebview2.exe while the window
+// belongs to the sidecar. And this FAILS CLOSED -- an element whose hosting
+// window is unknown is treated as ours -- because an unknown host cannot be
+// shown NOT to be a panel, and silently recording what the person typed into
+// Jarvis is the worse of the two outcomes. Dropping a step the person can
+// re-record is the cheaper one.
+func ownWindowVerdict(elemPid, hostPid, ownPid uint32, hostKnown bool) bool {
+	if elemPid == ownPid || hostPid == ownPid {
+		return true
+	}
+	return !hostKnown
+}
+
+// ownWindowReason explains an ownWindowVerdict of true, so the two causes are
+// distinguishable in sidecar.log. They are not the same thing to a person
+// asking why the recorder ignored what they just did: one is working as
+// intended, the other is a UIA read this machine would not answer.
+func ownWindowReason(elemPid, hostPid, ownPid uint32, hostKnown bool) string {
+	if elemPid == ownPid || hostPid == ownPid {
+		return "one of Jarvis's own windows"
+	}
+	if !hostKnown {
+		return "an element whose hosting window could not be read, dropped rather than risk recording a Jarvis panel"
+	}
+	return "not one of Jarvis's own windows"
+}
+
+// recorderFrame builds the frame the brain accepts. The envelope matters:
+// the brain's validator drops any frame whose `type` is not one of
+// rpc_result / rpc_progress / sidecar_event before it reaches a listener, so
+// an event built with only EventType and Payload is silently lost. Every
+// observer sets these three fields; the recorder must too.
+func recorderFrame(eventType string, payload map[string]any) SidecarEvent {
+	return SidecarEvent{
+		Type:      "sidecar_event",
+		EventType: eventType,
+		Timestamp: time.Now().UnixMilli(),
+		Priority:  "normal",
+		Payload:   payload,
+	}
+}
+
 func recorderEmit(eventType string, payload map[string]any) {
 	recorderMu.Lock()
 	ctx, send := recorderCtx, recorderSend
@@ -87,7 +146,9 @@ func recorderEmit(eventType string, payload map[string]any) {
 	if send == nil || ctx == nil {
 		return
 	}
-	_ = send(ctx, SidecarEvent{EventType: eventType, Payload: payload}, nil)
+	if err := send(ctx, recorderFrame(eventType, payload), nil); err != nil {
+		log.Printf("[recorder] send %s failed: %v", eventType, err)
+	}
 }
 
 // emitInteraction sends one ui_interaction event to the brain. The payload
